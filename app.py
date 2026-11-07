@@ -292,7 +292,7 @@ h1{margin:0;font-size:28px;letter-spacing:.5px;color:#fff}
 .panel h2{margin:0 0 14px;font-size:16px;color:#f97316;text-transform:uppercase;letter-spacing:1px}
 label{display:block;font-size:12px;color:#94a3b8;margin:10px 0 4px}
 input{width:100%;padding:9px 11px;border-radius:8px;border:1px solid #334155;background:#0f172a;color:#e2e8f0}
-.row{display:grid;grid-template-columns:1.2fr 1.4fr .8fr auto;gap:8px;align-items:end;margin-bottom:6px}
+.row{display:grid;grid-template-columns:minmax(13.5rem,1.5fr) 1.3fr 5.5rem auto;gap:8px;align-items:end;margin-bottom:6px}
 button{cursor:pointer;border:0;border-radius:8px;padding:10px 16px;font-weight:600;color:#fff;background:#f97316}
 button.sec{background:#334155}
 button:hover{filter:brightness(1.1)}
@@ -306,6 +306,14 @@ button:hover{filter:brightness(1.1)}
 pre{white-space:pre-wrap;margin:0;font-family:inherit;line-height:1.6}
 .row.bad .loc input{border-color:#ef4444}
 .pin{font-size:11px}
+.row>div{min-width:0}
+@media(max-width:600px){
+ body{padding:16px 10px}
+ .container{padding:16px}
+ .row{grid-template-columns:1fr 5.5rem auto;padding-bottom:10px;border-bottom:1px solid rgba(148,163,184,.12)}
+ .row>div:first-child{grid-column:1/-1}
+ #map{height:340px}
+}
 .planbtns{display:flex;gap:8px;flex-wrap:wrap;margin-top:6px}
 #mapbox{margin-top:14px}
 #map{height:400px;border-radius:10px;border:1px solid #334155}
@@ -414,8 +422,10 @@ function toggleMap(){
   if(typeof L==='undefined'){$('mapinfo').textContent='지도 라이브러리(Leaflet)를 불러오지 못했습니다.';return;}
   if(!map){
     map=L.map('map',{doubleClickZoom:false}).setView([37.5665,126.978],12);
-    L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png',
-      {maxZoom:19,attribution:'&copy; OpenStreetMap contributors'}).addTo(map);
+    // tile.openstreetmap.org 는 Codespaces 등에서 접속 시 403(Access blocked)을 돌려줄 수 있어 Esri 타일을 쓴다 (CARTO 는 API 키 필요)
+    L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Street_Map/MapServer/tile/{z}/{y}/{x}',
+      {maxZoom:19,referrerPolicy:'strict-origin-when-cross-origin',
+       attribution:'Tiles &copy; Esri &mdash; Esri, HERE, Garmin, &copy; OpenStreetMap contributors, and the GIS User Community'}).addTo(map);
     line=L.polyline([],{color:'#f97316',weight:5,opacity:.85}).addTo(map);
     markers=L.layerGroup().addTo(map);
     map.on('click',e=>addVia(e.latlng));
