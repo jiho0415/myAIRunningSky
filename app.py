@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import List, Optional
 
 import requests
+import kma
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
@@ -20,10 +21,8 @@ IMG_DIR.mkdir(exist_ok=True)
 app = FastAPI(title="RunWeather Agent")
 app.mount("/images", StaticFiles(directory=str(IMG_DIR)), name="images")
 
-GEOCODE_URL = "https://geocoding-api.open-meteo.com/v1/search"
-FORECAST_URL = "https://api.open-meteo.com/v1/forecast"
-HOURLY_VARS = ("temperature_2m,relative_humidity_2m,apparent_temperature,"
-               "precipitation_probability,wind_speed_10m,weather_code")
+SOURCE = "Korea Meteorological Administration (KMA)"   # 날씨 데이터 출처 표기
+GEOCODE_URL = "https://geocoding-api.open-meteo.com/v1/search"  # 장소명 -> 좌표 검색 전용 (날씨 데이터 아님)
 
 
 # ───────────────────────── Models ─────────────────────────
@@ -40,8 +39,24 @@ class RunPlan(BaseModel):
 
 
 # ───────────────────────── Weather helpers ─────────────────────────
+# Open-Meteo 지오코딩은 한글 지명("서울" 등)에서 결과가 없거나 엉뚱한 곳을 돌려주는 경우가 있어
+# 주요 도시는 좌표를 직접 둔다. 목록에 없으면 아래 지오코딩으로 조회한다.
+KR_CITIES = {
+    "서울": (37.5665, 126.9780), "인천": (37.4563, 126.7052), "수원": (37.2636, 127.0286),
+    "성남": (37.4200, 127.1267), "고양": (37.6584, 126.8320), "용인": (37.2411, 127.1776),
+    "춘천": (37.8813, 127.7298), "강릉": (37.7519, 128.8761), "대전": (36.3504, 127.3845),
+    "세종": (36.4800, 127.2890), "청주": (36.6424, 127.4890), "전주": (35.8242, 127.1480),
+    "광주": (35.1595, 126.8526), "대구": (35.8714, 128.6014), "울산": (35.5384, 129.3114),
+    "부산": (35.1796, 129.0756), "창원": (35.2280, 128.6811), "제주": (33.4996, 126.5312),
+}
+
+
 def geocode(name: str) -> dict:
-    """Place name -> {lat, lon, name} using Open-Meteo geocoding (no API key)."""
+    """Place name -> {lat, lon, name}. 주요 도시는 내장 좌표, 그 외는 Open-Meteo geocoding."""
+    key = name.strip().removesuffix("특별시").removesuffix("광역시").removesuffix("시")
+    if key in KR_CITIES:
+        lat, lon = KR_CITIES[key]
+        return {"lat": lat, "lon": lon, "name": key}
     r = requests.get(GEOCODE_URL, params={"name": name, "count": 1, "language": "ko"}, timeout=10)
     r.raise_for_status()
     results = r.json().get("results")
@@ -52,26 +67,24 @@ def geocode(name: str) -> dict:
 
 
 def fetch_forecast(lat: float, lon: float, when: datetime) -> dict:
-    """Hourly forecast nearest to `when` at (lat, lon).
+    """`when` 시각의 날씨 (기상청 KMA). 서울은 nx=55, ny=127 기준.
 
-    Draft using Open-Meteo. To switch to KMA (기상청 단기예보), replace this with a call to
-    getVilageFcst (data.go.kr) after converting lat/lon to the KMA nx/ny grid.
+    지금~직전 3시간은 초단기실황(getUltraSrtNcst), 이후 약 2.5일은 단기예보.
+    조회 실패/범위 밖이면 kma.KMAError 를 그대로 올린다 (다른 소스로 대체하지 않음).
     """
-    day = when.strftime("%Y-%m-%d")
-    r = requests.get(FORECAST_URL, params={
-        "latitude": lat, "longitude": lon, "hourly": HOURLY_VARS,
-        "timezone": "auto", "start_date": day, "end_date": day,
-    }, timeout=10)
-    r.raise_for_status()
-    h = r.json()["hourly"]
-    idx = min(when.hour, len(h["time"]) - 1)
+    nx, ny = kma.grid_for(lat, lon)
+    k = kma.fetch_weather(nx, ny, when)
+    kma.save_log(k, nx, ny)  # 실황(관측값)이면 weather_logs 에 적재
+    humidity = k["humidity"] if k["humidity"] is not None else 50.0
     return {
-        "temp_c": h["temperature_2m"][idx],
-        "feels_like_c": h["apparent_temperature"][idx],
-        "humidity": h["relative_humidity_2m"][idx],
-        "wind_kmh": h["wind_speed_10m"][idx],
-        "rain_prob": h["precipitation_probability"][idx],
-        "weather_code": h["weather_code"][idx],
+        "temp_c": k["temp_c"],
+        "feels_like_c": kma.apparent_temp(k["temp_c"], humidity, k["wind_ms"]),
+        "humidity": humidity,
+        "wind_kmh": round(k["wind_ms"] * 3.6, 1),
+        "rain_prob": k["rain_prob"],
+        "condition": k["condition"],
+        "source": SOURCE,
+        "grid": {"nx": nx, "ny": ny},
     }
 
 
@@ -114,8 +127,10 @@ def run_weather(plan: RunPlan):
             w = fetch_forecast(place["lat"], place["lon"], when)
         except ValueError as e:
             raise HTTPException(422, str(e))
+        except kma.KMAError as e:
+            raise HTTPException(502, f"기상청(KMA) 조회 실패: {e}")
         except requests.RequestException as e:
-            raise HTTPException(502, f"날씨 API 오류: {e}")
+            raise HTTPException(502, f"장소 검색 API 오류: {e}")
         out.append({
             "time": cp.time, "location": place["name"], "distance_km": cp.distance_km,
             "lat": place["lat"], "lon": place["lon"], "weather": w,
@@ -123,7 +138,22 @@ def run_weather(plan: RunPlan):
             "outfit": outfit_guide(w["feels_like_c"], w["rain_prob"] or 0, w["wind_kmh"]),
         })
     avg = round(sum(c["run_index"]["score"] for c in out) / len(out))
-    return {"count": len(out), "avg_run_index": avg, "checkpoints": out}
+    return {"count": len(out), "avg_run_index": avg, "source": SOURCE, "checkpoints": out}
+
+
+@app.get("/api/weather")
+def api_weather(nx: int = kma.SEOUL_NX, ny: int = kma.SEOUL_NY):
+    """기상청 실황(기본: 서울 nx=55, ny=127)을 가져와 weather_logs 에 적재하고 JSON 으로 반환."""
+    try:
+        k = kma.fetch_weather(nx, ny)
+    except kma.KMAError as e:
+        raise HTTPException(502, str(e))
+    return {**k, "nx": nx, "ny": ny, "source": SOURCE, "saved": kma.save_log(k, nx, ny)}
+
+
+@app.get("/api/weather/history")
+def api_weather_history(limit: int = 24):
+    return kma.recent_logs(max(1, min(limit, 500)))
 
 
 @app.get("/api/health")
@@ -227,7 +257,7 @@ async function sync(){
     const res=await fetch('/api/run-weather',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({checkpoints})});
     if(!res.ok)throw new Error((await res.json()).detail||res.status);
     data=await res.json();render();
-    $('status').textContent='동기화 완료 · '+new Date().toLocaleTimeString();
+    $('status').textContent='동기화 완료 · '+new Date().toLocaleTimeString()+' · 데이터 출처: '+data.source;
   }catch(e){$('status').textContent='오류: '+e.message;}
 }
 function render(){
@@ -245,7 +275,8 @@ function pick(i){
    <div class="stat"><span>🌡 체감온도</span><b>${w.feels_like_c}°C</b></div>
    <div class="stat"><span>💧 습도</span><b>${w.humidity}%</b></div>
    <div class="stat"><span>☔ 강수확률</span><b>${w.rain_prob}%</b></div>
-   <div style="margin-top:12px">👕 <b>복장 가이드</b><br><span class="muted">${c.outfit}</span></div>`;
+   <div style="margin-top:12px">👕 <b>복장 가이드</b><br><span class="muted">${c.outfit}</span></div>
+   <div class="muted" style="margin-top:12px;font-size:12px">📡 ${w.source}</div>`;
 }
 function report(){
   if(!data){$('status').textContent='먼저 날씨를 동기화하세요.';return;}
@@ -253,7 +284,7 @@ function report(){
   $('advisor').className='';
   $('advisor').textContent=`평균 런닝 지수: ${data.avg_run_index}/100\\n`+
    `가장 주의할 구간: ${worst.location} (${worst.time.replace('T',' ')}, ${worst.run_index.score}점)\\n`+
-   `추천 복장: ${worst.outfit}\\n(LLM 기반 어드바이저는 다음 교시에 연동 예정)`;
+   `추천 복장: ${worst.outfit}\\n데이터 출처: ${data.source}\\n(LLM 기반 어드바이저는 다음 교시에 연동 예정)`;
   $('status').textContent='리포트 생성 완료';
 }
 </script></body></html>"""
