@@ -1,0 +1,98 @@
+<!doctype html>
+<html lang="ko"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>myAISky - 실시간 날씨</title>
+<style>
+*{box-sizing:border-box}
+body{margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;padding:24px 16px;
+ font-family:'Segoe UI',system-ui,sans-serif;color:#e2e8f0;background:#0f172a;
+ background-image:linear-gradient(160deg,#1e3a8a 0%,#0f172a 60%);transition:background .6s}
+body.rain{background-image:linear-gradient(160deg,#334155 0%,#0f172a 60%)}
+body.snow{background-image:linear-gradient(160deg,#64748b 0%,#1e293b 60%)}
+body.clear{background-image:linear-gradient(160deg,#0369a1 0%,#1e3a8a 55%,#0f172a 100%)}
+.card{width:100%;max-width:520px;background:rgba(15,23,42,.72);border:1px solid rgba(148,163,184,.2);
+ border-radius:24px;padding:28px;backdrop-filter:blur(8px);box-shadow:0 20px 60px rgba(0,0,0,.45)}
+.top{display:flex;justify-content:space-between;align-items:center;color:#94a3b8;font-size:14px}
+.live{display:inline-flex;align-items:center;gap:6px;color:#4ade80;font-weight:600}
+.dot{width:8px;height:8px;border-radius:50%;background:#4ade80;animation:pulse 2s infinite}
+.err .dot{background:#f87171;animation:none}.err .live{color:#f87171}
+@keyframes pulse{50%{opacity:.3}}
+.hero{text-align:center;padding:26px 0 18px}
+.icon{font-size:84px;line-height:1}
+.temp{font-size:92px;font-weight:200;line-height:1.05;color:#fff}
+.temp small{font-size:36px;vertical-align:top;color:#94a3b8}
+.cond{font-size:22px;color:#f1f5f9;margin-top:4px}
+.stats{display:grid;grid-template-columns:repeat(3,1fr);gap:10px;margin:8px 0 22px}
+.stat{background:rgba(30,41,59,.7);border-radius:14px;padding:12px;text-align:center}
+.stat span{display:block;font-size:12px;color:#94a3b8}.stat b{font-size:18px;color:#fff}
+h2{margin:0 0 10px;font-size:13px;letter-spacing:1px;text-transform:uppercase;color:#f97316}
+table{width:100%;border-collapse:collapse;font-size:14px}
+td{padding:7px 4px;border-bottom:1px solid rgba(148,163,184,.12)}
+td:last-child{text-align:right;font-weight:600;color:#fff}.muted{color:#94a3b8}
+#msg{margin-top:14px;font-size:13px;color:#94a3b8;text-align:center;min-height:18px}
+button{cursor:pointer;border:0;border-radius:8px;padding:6px 12px;font-weight:600;color:#fff;background:#334155}
+button:hover{filter:brightness(1.2)}
+</style></head><body>
+<div class="card" id="card">
+ <div class="top">
+  <span>📍 <span id="loc">서울</span> · 기상청 초단기실황</span>
+  <span class="live"><span class="dot"></span><span id="live">연결 중</span></span>
+ </div>
+
+ <div class="hero">
+  <div class="icon" id="icon">⏳</div>
+  <div class="temp"><span id="temp">--</span><small>°C</small></div>
+  <div class="cond" id="cond">불러오는 중...</div>
+ </div>
+
+ <div class="stats">
+  <div class="stat"><span>💧 습도</span><b id="hum">--</b></div>
+  <div class="stat"><span>💨 풍속</span><b id="wind">--</b></div>
+  <div class="stat"><span>☔ 1시간 강수</span><b id="rain">--</b></div>
+ </div>
+
+ <h2>최근 기록 (DB)</h2>
+ <table id="hist"><tr><td class="muted">기록 없음</td></tr></table>
+
+ <div id="msg"></div>
+ <div style="text-align:center;margin-top:8px"><button onclick="load()">🔄 지금 새로고침</button></div>
+</div>
+
+<script>
+const $ = id => document.getElementById(id);
+const ICON = c => c.includes('눈') ? '❄️' : c.includes('비') || c.includes('빗방울') ? '🌧️'
+  : c === '맑음' ? '☀️' : c === '구름많음' ? '⛅' : c === '흐림' ? '☁️' : '🌤️';
+const THEME = c => c.includes('눈') ? 'snow' : c.includes('비') || c.includes('빗방울') ? 'rain'
+  : c === '맑음' ? 'clear' : '';
+const fmt = (v, u) => v == null ? '--' : v + u;
+const when = t => t.replace('T', ' ').slice(5, 16);
+
+async function load() {
+  try {
+    const [w, h] = await Promise.all([
+      fetch('/api/weather').then(r => r.ok ? r.json() : r.json().then(e => { throw new Error(e.detail || r.status); })),
+      fetch('/api/weather/history?limit=8').then(r => r.json()),
+    ]);
+    $('card').classList.remove('err');
+    $('live').textContent = 'LIVE';
+    $('loc').textContent = w.location;
+    $('icon').textContent = ICON(w.condition);
+    $('temp').textContent = w.temperature.toFixed(1);
+    $('cond').textContent = w.condition;
+    $('hum').textContent = fmt(w.humidity, '%');
+    $('wind').textContent = fmt(w.wind_speed, ' m/s');
+    $('rain').textContent = fmt(w.rain_1h, ' mm');
+    document.body.className = THEME(w.condition);
+    $('hist').innerHTML = h.length
+      ? h.map(r => `<tr><td class="muted">${when(r.timestamp)}</td><td>${r.condition}</td><td>${r.temperature.toFixed(1)}°C</td></tr>`).join('')
+      : '<tr><td class="muted">기록 없음</td></tr>';
+    $('msg').textContent = `관측 기준 ${when(w.timestamp)} · ${w.saved ? 'DB에 저장됨' : '이미 저장된 시각'} · 갱신 ${new Date().toLocaleTimeString()}`;
+  } catch (e) {
+    $('card').classList.add('err');
+    $('live').textContent = 'ERROR';
+    $('msg').textContent = '오류: ' + e.message;
+  }
+}
+load();
+setInterval(load, 5 * 60 * 1000);   // 5분마다 자동 갱신 (실황은 매시 갱신)
+</script></body></html>
