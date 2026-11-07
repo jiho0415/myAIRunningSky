@@ -5,6 +5,7 @@ Run:  uvicorn app:app --reload --host 0.0.0.0 --port 8000
 import math
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from functools import lru_cache
 from pathlib import Path
@@ -29,6 +30,7 @@ SOURCE = "Korea Meteorological Administration (KMA)"   # 날씨 데이터 출처
 GEOCODE_URL = "https://geocoding-api.open-meteo.com/v1/search"  # 장소명 -> 좌표 검색 전용 (날씨 데이터 아님)
 NOMINATIM_URL = "https://nominatim.openstreetmap.org/search"     # 도로명/지번 주소 -> 좌표 (OpenStreetMap)
 OSRM_FOOT_URL = "https://routing.openstreetmap.de/routed-foot/route/v1/foot/"  # 도보 경로 (FOSSGIS OSRM)
+VALHALLA_URL = "https://valhalla1.openstreetmap.de/route"  # 도보 경로 대체 서버 (FOSSGIS Valhalla)
 HTTP_HEADERS = {"User-Agent": "RunWeatherAgent/0.1 (running weather dashboard)"}
 
 
@@ -48,6 +50,14 @@ class RunPlan(BaseModel):
 class RouteRequest(BaseModel):
     points: List[Tuple[float, float]] = Field(..., description="[[lat, lon], ...] 출발→도착 순서")
     follow_roads: bool = True
+
+
+class RecommendRequest(BaseModel):
+    lat: float
+    lon: float
+    distance_km: float = Field(..., ge=1, le=50, description="목표 거리 (km)")
+    count: int = Field(3, ge=1, le=5)
+    seed: int = Field(0, ge=0, description="값을 바꾸면 다른 방향의 코스를 추천")
 
 
 # ───────────────────────── Weather helpers ─────────────────────────
@@ -118,29 +128,110 @@ def _haversine_km(a: Tuple[float, float], b: Tuple[float, float]) -> float:
     return 2 * 6371.0088 * math.asin(math.sqrt(h))
 
 
-@lru_cache(maxsize=128)
+class RoutingUnavailable(RuntimeError):
+    """도보 경로 서버 응답 없음/오류 (잠시 호출을 멈춘다)."""
+
+
+class NoRouteFound(RuntimeError):
+    """서버는 정상이지만 지점 사이 도보 경로가 없음 (바다 위 지점 등)."""
+
+
+# 공용 무료 서버(FOSSGIS)라 서버별 동시 호출을 2개로 제한하고, 실패한 서버는 60초간 호출하지 않는다
+_route_sem = {"osrm": threading.Semaphore(2), "valhalla": threading.Semaphore(2)}
+_route_down_until = {"osrm": 0.0, "valhalla": 0.0}
+
+
+def _decode_polyline6(enc: str) -> List[List[float]]:
+    coords, idx, lat, lon = [], 0, 0, 0
+    while idx < len(enc):
+        for which in (0, 1):
+            shift = result = 0
+            while True:
+                b = ord(enc[idx]) - 63
+                idx += 1
+                result |= (b & 0x1F) << shift
+                shift += 5
+                if b < 0x20:
+                    break
+            delta = ~(result >> 1) if result & 1 else result >> 1
+            if which == 0:
+                lat += delta
+            else:
+                lon += delta
+        coords.append([round(lat / 1e6, 6), round(lon / 1e6, 6)])
+    return coords
+
+
+def _osrm(points: Tuple[Tuple[float, float], ...]) -> dict:
+    coords = ";".join(f"{lon:.6f},{lat:.6f}" for lat, lon in points)
+    r = requests.get(OSRM_FOOT_URL + coords, headers=HTTP_HEADERS, timeout=10,
+                     params={"overview": "full", "geometries": "geojson"})
+    if r.status_code == 400 and r.json().get("code") in ("NoRoute", "NoSegment"):
+        raise NoRouteFound(r.json().get("code"))
+    r.raise_for_status()
+    body = r.json()
+    if body.get("code") != "Ok" or not body.get("routes"):
+        raise NoRouteFound(body.get("code", "unknown"))
+    rt = body["routes"][0]
+    legs = [round(leg["distance"] / 1000, 3) for leg in rt["legs"]]
+    return {"coordinates": [[la, lo] for lo, la in rt["geometry"]["coordinates"]],
+            "legs_km": legs, "distance_km": round(sum(legs), 2), "mode": "road",
+            "snapped": [[round(w["location"][1], 6), round(w["location"][0], 6)] for w in body["waypoints"]]}
+
+
+def _valhalla(points: Tuple[Tuple[float, float], ...]) -> dict:
+    r = requests.post(VALHALLA_URL, headers=HTTP_HEADERS, timeout=10, json={
+        "locations": [{"lat": la, "lon": lo, "type": "break"} for la, lo in points],
+        "costing": "pedestrian", "units": "kilometers", "directions_type": "none"})
+    if r.status_code == 400:
+        raise NoRouteFound(str(r.json().get("error_code", "400")))
+    r.raise_for_status()
+    legs_raw = r.json()["trip"]["legs"]
+    coords: List[List[float]] = []
+    snapped = []
+    for leg in legs_raw:
+        shape = _decode_polyline6(leg["shape"])
+        snapped.append(shape[0])
+        coords.extend(shape if not coords else shape[1:])
+    snapped.append(coords[-1])
+    legs = [round(leg["summary"]["length"], 3) for leg in legs_raw]
+    return {"coordinates": coords, "legs_km": legs, "distance_km": round(sum(legs), 2),
+            "mode": "road", "snapped": snapped}
+
+
+@lru_cache(maxsize=256)  # 예외(실패)는 캐시되지 않는다
+def _osrm_route(points: Tuple[Tuple[float, float], ...]) -> dict:
+    """도보 경로: OSRM → 실패 시 Valhalla. 둘 다 장애면 RoutingUnavailable."""
+    errors = []
+    for name, fn in (("osrm", _osrm), ("valhalla", _valhalla)):
+        if time.monotonic() < _route_down_until[name]:
+            errors.append(f"{name}: 잠시 쉬는 중")
+            continue
+        try:
+            with _route_sem[name]:
+                return fn(points)
+        except NoRouteFound:
+            raise
+        except (requests.RequestException, ValueError, KeyError, IndexError) as e:
+            _route_down_until[name] = time.monotonic() + 60
+            errors.append(f"{name}: {type(e).__name__}")
+    raise RoutingUnavailable("도보 경로 서버가 응답하지 않습니다. 1분 뒤 다시 시도하세요. (" + ", ".join(errors) + ")")
+
+
 def plan_route(points: Tuple[Tuple[float, float], ...], follow_roads: bool) -> dict:
     """[(lat, lon), ...] 를 잇는 런닝 경로. 도보 도로를 따르고, 실패하면 직선으로 대체.
 
-    반환: {coordinates: [[lat, lon], ...], legs_km: [구간별 km], distance_km, mode: 'road'|'straight'}
+    반환: {coordinates: [[lat, lon], ...], legs_km: [구간별 km], distance_km, mode: 'road'|'straight',
+          snapped: [[lat, lon], ...] (각 지점을 실제 길 위로 옮긴 좌표)}
     """
     if follow_roads:
         try:
-            coords = ";".join(f"{lon:.6f},{lat:.6f}" for lat, lon in points)
-            r = requests.get(OSRM_FOOT_URL + coords, headers=HTTP_HEADERS, timeout=15,
-                             params={"overview": "full", "geometries": "geojson"})
-            r.raise_for_status()
-            body = r.json()
-            if body.get("code") == "Ok" and body.get("routes"):
-                rt = body["routes"][0]
-                legs = [round(leg["distance"] / 1000, 3) for leg in rt["legs"]]
-                return {"coordinates": [[la, lo] for lo, la in rt["geometry"]["coordinates"]],
-                        "legs_km": legs, "distance_km": round(sum(legs), 2), "mode": "road"}
-        except (requests.RequestException, ValueError, KeyError):
+            return _osrm_route(points)
+        except (RoutingUnavailable, NoRouteFound):
             pass
     legs = [round(_haversine_km(points[i], points[i + 1]), 3) for i in range(len(points) - 1)]
     return {"coordinates": [list(p) for p in points], "legs_km": legs,
-            "distance_km": round(sum(legs), 2), "mode": "straight"}
+            "distance_km": round(sum(legs), 2), "mode": "straight", "snapped": [list(p) for p in points]}
 
 
 def fetch_forecast(lat: float, lon: float, when: datetime) -> dict:
@@ -238,6 +329,98 @@ def api_weather_history(limit: int = 24):
     return kma.recent_logs(max(1, min(limit, 500)))
 
 
+DIRECTIONS = ["북", "북동", "동", "남동", "남", "남서", "서", "북서"]
+
+
+def _offset(lat: float, lon: float, km: float, bearing_deg: float) -> Tuple[float, float]:
+    """(lat, lon) 에서 bearing 방향으로 km 만큼 이동한 지점 (구면 근사)."""
+    R = 6371.0088
+    b, p1, l1 = math.radians(bearing_deg), math.radians(lat), math.radians(lon)
+    d = km / R
+    p2 = math.asin(math.sin(p1) * math.cos(d) + math.cos(p1) * math.sin(d) * math.cos(b))
+    l2 = l1 + math.atan2(math.sin(b) * math.sin(d) * math.cos(p1), math.cos(d) - math.sin(p1) * math.sin(p2))
+    return round(math.degrees(p2), 6), round(math.degrees(l2), 6)
+
+
+def _loop_waypoints(lat: float, lon: float, r_km: float, bearing: float) -> List[Tuple[float, float]]:
+    """출발점을 지나는 반지름 r 원 위의 경유지 3개 (원의 중심은 출발점에서 bearing 방향)."""
+    clat, clon = _offset(lat, lon, r_km, bearing)
+    back = (bearing + 180) % 360  # 중심에서 본 출발점 방향
+    return [_offset(clat, clon, r_km, back + a) for a in (90, 180, 270)]
+
+
+def _overlap_ratio(coords: List[List[float]]) -> float:
+    """경로에서 같은 길을 두 번 이상 지나는 거리 비율 (0=완전 순환, 1에 가까울수록 왕복)."""
+    seen: dict = {}
+    total = 0.0
+    for a, b in zip(coords, coords[1:]):
+        d = _haversine_km(tuple(a), tuple(b))
+        ka, kb = (round(a[0], 4), round(a[1], 4)), (round(b[0], 4), round(b[1], 4))
+        if ka == kb:
+            continue
+        key = (ka, kb) if ka < kb else (kb, ka)
+        seen.setdefault(key, [0, d])[0] += 1
+        total += d
+    if total <= 0:
+        return 0.0
+    return round(sum(d * n for n, d in seen.values() if n > 1) / total, 3)
+
+
+def recommend_loop(lat: float, lon: float, target_km: float, bearing: float) -> Optional[dict]:
+    """bearing 방향으로 뻗는 순환 코스. 실제 도보 경로 거리가 목표에 가까워지도록 반지름을 보정.
+
+    경로가 없는 방향(바다 등)이면 None. 서버 장애면 RoutingUnavailable 을 올린다.
+    """
+    r = target_km / (2 * math.pi) / 1.25  # 도로 우회 계수 ~1.25 로 시작
+    best = None
+    for _ in range(3):  # 공용 서버 부담을 줄이려고 보정은 최대 2번
+        wps = _loop_waypoints(lat, lon, r, bearing)
+        try:
+            route = _osrm_route(((lat, lon), *wps, (lat, lon)))
+        except NoRouteFound:
+            break
+        err = abs(route["distance_km"] - target_km) / target_km
+        if best is None or err < best["error"]:
+            best = {"waypoints": wps, "route": route, "error": err}
+        if err < 0.08 or route["distance_km"] <= 0:
+            break
+        r *= target_km / route["distance_km"]
+    if best is None:
+        return None
+    rt = best["route"]
+    overlap = _overlap_ratio(rt["coordinates"])
+    return {
+        "overlap": overlap,
+        "error": round(best["error"], 3),
+        "label": f"{DIRECTIONS[round(bearing / 45) % 8]}쪽 순환 코스",
+        "bearing": bearing,
+        "distance_km": rt["distance_km"],
+        "legs_km": rt["legs_km"],
+        "coordinates": rt["coordinates"],
+        "mode": rt["mode"],
+        "waypoints": rt["snapped"][1:-1],  # 강·건물 위가 아닌 실제 길 위 좌표
+    }
+
+
+@app.post("/api/recommend")
+def api_recommend(req: RecommendRequest):
+    """출발점에서 목표 거리만큼 달리고 돌아오는 순환 코스를 방향별로 추천."""
+    # 후보를 count 의 2배(방향 60° 간격)로 만들고, 왕복(중복) 구간이 적고 목표 거리에 가까운 순으로 고른다
+    n = req.count * 2
+    bearings = [round((req.seed * 30 + i * 360 / n) % 360, 1) for i in range(n)]
+    try:
+        with ThreadPoolExecutor(max_workers=2) as ex:
+            cands = [c for c in ex.map(lambda b: recommend_loop(req.lat, req.lon, req.distance_km, b), bearings) if c]
+    except RoutingUnavailable as e:
+        raise HTTPException(503, str(e))
+    if not cands:
+        raise HTTPException(404, "이 출발지 주변에서 달릴 수 있는 순환 코스를 찾지 못했습니다.")
+    # 목표 거리 ±15% 이내이면서 왕복(중복) 구간이 절반 미만인 코스를 우선하고,
+    # 그 안에서 중복 구간이 적고 거리 오차가 작은 순
+    cands.sort(key=lambda r: (r["error"] > 0.15 or r["overlap"] >= 0.5, r["overlap"] + 2 * r["error"]))
+    return {"target_km": req.distance_km, "start": [req.lat, req.lon], "routes": cands[:req.count]}
+
+
 @app.get("/api/geocode")
 def api_geocode(q: str):
     if not q.strip():
@@ -322,6 +505,23 @@ pre{white-space:pre-wrap;margin:0;font-family:inherit;line-height:1.6}
 .mapbar button{padding:6px 10px;font-size:12px}
 #mapinfo b{color:#4ade80}
 .hint{font-size:12px;color:#94a3b8;margin-top:6px}
+#recbox{background:rgba(15,23,42,.6);border:1px solid #334155;border-radius:10px;padding:12px;margin-bottom:10px}
+.recform{display:flex;gap:8px;flex-wrap:wrap;align-items:end}
+.recform>div{width:7.5rem}
+.recform>div.wide{width:auto;flex:1 1 14rem}
+.startrow{display:flex;gap:6px}
+.startrow button{padding:8px 10px;font-size:12px;white-space:nowrap}
+.picking #map{cursor:crosshair}
+.startm{width:22px;height:22px;border-radius:50%;background:#22c55e;border:3px solid #fff;
+ box-shadow:0 1px 4px rgba(0,0,0,.6);display:flex;align-items:center;justify-content:center;font-size:11px}
+.recform label{margin-top:0}
+.reccard{display:flex;align-items:center;gap:10px;padding:9px 10px;margin-top:8px;border-radius:8px;
+ background:rgba(30,41,59,.8);border:1px solid transparent;cursor:pointer}
+.reccard:hover,.reccard.sel{border-color:#f97316}
+.reccard .sw{width:14px;height:14px;border-radius:50%;flex:none}
+.reccard .tx{flex:1;min-width:0}
+.reccard small{color:#94a3b8}
+.reccard button{padding:6px 10px;font-size:12px}
 .cpm{width:26px;height:26px;border-radius:50%;background:#f97316;color:#fff;font-weight:700;font-size:13px;
  display:flex;align-items:center;justify-content:center;border:2px solid #fff;box-shadow:0 1px 4px rgba(0,0,0,.5)}
 .via{width:14px;height:14px;border-radius:50%;background:#fff;border:3px solid #f97316;box-shadow:0 1px 3px rgba(0,0,0,.5)}
@@ -340,8 +540,23 @@ pre{white-space:pre-wrap;margin:0;font-family:inherit;line-height:1.6}
     <div class="planbtns">
      <button class="sec" onclick="addSegment()">+ 구간 추가</button>
      <button onclick="toggleMap()">🗺 런닝 구간</button>
+     <button class="sec" onclick="openRecommend()">✨ 추천</button>
     </div>
     <div id="mapbox" hidden>
+     <div id="recbox" hidden>
+      <div class="recform">
+       <div class="wide"><label>출발 위치</label>
+        <div class="startrow"><input id="recstart" placeholder="주소 또는 장소 (비우면 1번 구간)">
+         <button class="sec" type="button" onclick="pickStart()">📍 지도에서 선택</button></div></div>
+       <div><label>목표 거리(km)</label><input id="recdist" type="number" min="1" max="50" step="0.5" value="5"></div>
+       <div><label>페이스(분/km)</label><input id="recpace" type="number" min="3" max="12" step="0.1" value="6"></div>
+       <button onclick="recommend(false)">코스 추천</button>
+       <button class="sec" onclick="recommend(true)">🔄 다른 방향</button>
+       <button class="sec" onclick="closeRecommend()">닫기</button>
+      </div>
+      <div class="hint">출발 위치에서 출발해 돌아오는 순환 코스를 추천합니다. 초록 출발 마커는 끌어서 옮길 수 있습니다.</div>
+      <div id="reclist"></div>
+     </div>
      <div class="mapbar">
       <label style="display:flex;align-items:center;margin:0;color:#e2e8f0"><input type="checkbox" id="roads" checked onchange="scheduleRoute(0)">도로 따라가기</label>
       <button class="sec" onclick="fitRoute()">🎯 전체 보기</button>
@@ -411,28 +626,49 @@ function addSegment(){
   if(mapOpen()){needFit=true;refreshMap();}
 }
 addRow(ts(6),'서울',0);addRow(ts(7),'인천',10);
+$('recstart').addEventListener('input',()=>{recStart=null;});
 
 // ───── 런닝 구간 지도 ─────
-let map=null,line=null,markers=null,seq=[],routeTimer=null,routeReq=0,refreshReq=0,needFit=true;
+let map=null,line=null,markers=null,recLayer=null,recs=[],recSeed=0,recStart=null,startMarker=null,picking=false,seq=[],routeTimer=null,routeReq=0,refreshReq=0,needFit=true;
 const mapOpen=()=>map&&!$('mapbox').hidden;
 function toggleMap(){
   const box=$('mapbox');
-  if(!box.hidden){box.hidden=true;return;}
+  if(!box.hidden){box.hidden=true;return Promise.resolve();}
   box.hidden=false;
   if(typeof L==='undefined'){$('mapinfo').textContent='지도 라이브러리(Leaflet)를 불러오지 못했습니다.';return;}
   if(!map){
     map=L.map('map',{doubleClickZoom:false}).setView([37.5665,126.978],12);
-    // tile.openstreetmap.org 는 Codespaces 등에서 접속 시 403(Access blocked)을 돌려줄 수 있어 Esri 타일을 쓴다 (CARTO 는 API 키 필요)
-    L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Street_Map/MapServer/tile/{z}/{y}/{x}',
-      {maxZoom:19,referrerPolicy:'strict-origin-when-cross-origin',
-       attribution:'Tiles &copy; Esri &mdash; Esri, HERE, Garmin, &copy; OpenStreetMap contributors, and the GIS User Community'}).addTo(map);
+    // tile.openstreetmap.org 는 Codespaces 접속 시 403(Access blocked), Esri 도로지도는 한국에서 13배율까지만,
+    // CARTO 는 API 키 필요 → OSM 프랑스(HOT/CycloSM) 타일을 쓰고, 막히면 다음 지도로 자동 전환
+    const BASES=[
+      ['기본 지도 (OSM)','https://{s}.tile.openstreetmap.fr/hot/{z}/{x}/{y}.png',
+        {subdomains:'abc',attribution:'&copy; OpenStreetMap contributors · Tiles: HOT, OSM France'}],
+      ['산책로·자전거길 (CycloSM)','https://{s}.tile-cyclosm.openstreetmap.fr/cyclosm/{z}/{x}/{y}.png',
+        {subdomains:'abc',attribution:'&copy; OpenStreetMap contributors · CycloSM'}],
+      ['위성 (Esri)','https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}',
+        {attribution:'Tiles &copy; Esri, Maxar, Earthstar Geographics'}],
+    ];
+    const layers=BASES.map(([,url,o])=>L.tileLayer(url,{...o,maxZoom:19,referrerPolicy:'strict-origin-when-cross-origin'}));
+    layers.forEach((l,i)=>{
+      let ok=0,bad=0;
+      l.on('tileload',()=>ok++);
+      l.on('tileerror',()=>{
+        if(++bad>=4&&!ok&&map.hasLayer(l)&&layers[i+1]){
+          map.removeLayer(l);layers[i+1].addTo(map);
+          $('mapinfo').textContent=`'${BASES[i][0]}' 지도를 불러오지 못해 '${BASES[i+1][0]}'(으)로 전환했습니다.`;
+        }
+      });
+    });
+    layers[0].addTo(map);
+    L.control.layers(Object.fromEntries(BASES.map(([n],i)=>[n,layers[i]])),null,{position:'topright'}).addTo(map);
     line=L.polyline([],{color:'#f97316',weight:5,opacity:.85}).addTo(map);
     markers=L.layerGroup().addTo(map);
-    map.on('click',e=>addVia(e.latlng));
+    recLayer=L.layerGroup().addTo(map);
+    map.on('click',e=>picking?setRecStart(e.latlng,'지도에서 선택한 위치'):addVia(e.latlng));
   }
   needFit=true;
   setTimeout(()=>map.invalidateSize(),0);
-  refreshMap();
+  return refreshMap();
 }
 // seq: 경로 순서대로의 지점 목록. {kind:'cp',row} = Run Plan 구간, {kind:'via',lat,lon} = 경유지
 function pts(){
@@ -460,7 +696,7 @@ async function refreshMap(){
     if(my!==refreshReq)return;
   }
   drawMarkers();
-  if(needFit){fitRoute();needFit=false;}
+  if(needFit)fitRoute();  // 경로가 오기 전 마커 기준으로 먼저 맞추고, 경로가 오면 다시 맞춘다
   await updateRoute();
   if(failed.length)$('mapinfo').textContent+=` · 찾지 못한 장소: ${failed.join(', ')}`;
 }
@@ -516,11 +752,136 @@ async function updateRoute(){
     if(!res.ok)throw new Error((await res.json()).detail||res.status);
     const r=await res.json();if(my!==routeReq)return;
     line.setLatLngs(r.coordinates);
+    if(needFit){fitRoute();needFit=false;}
     let cum=0;
     P.forEach((p,i)=>{if(i>0)cum+=r.legs_km[i-1];if(p.item.kind==='cp')p.item.row.querySelectorAll('input')[2].value=cum.toFixed(2);});
     $('mapinfo').innerHTML=`총 거리 <b>${r.distance_km.toFixed(2)} km</b> · `+
       (r.mode==='road'?'도보 도로 기준':($('roads').checked?'직선 거리 (도로 경로 조회 실패)':'직선 거리'));
   }catch(e){if(my===routeReq)$('mapinfo').textContent='경로 오류: '+e.message;}
+}
+
+// ───── 코스 추천 ─────
+const REC_COLORS=['#22c55e','#3b82f6','#a855f7','#eab308','#ec4899'];
+async function openRecommend(){
+  const first=!$('recbox').hidden?null:rowsEl()[0];
+  $('recbox').hidden=false;
+  if(!mapOpen())await toggleMap();
+  if(first&&!recStart&&!$('recstart').value.trim()){
+    $('recstart').value=first.querySelectorAll('input')[1].value;
+    if(hasPos(first))setRecStart(L.latLng(+first.dataset.lat,+first.dataset.lon),$('recstart').value,true);
+  }
+  $('recdist').focus();
+}
+function closeRecommend(restore=true){
+  $('recbox').hidden=true;recs=[];$('reclist').innerHTML='';
+  setPicking(false);
+  if(startMarker){startMarker.remove();startMarker=null;}
+  recStart=null;$('recstart').value='';
+  if(recLayer){recLayer.clearLayers();line.setStyle({opacity:.85});drawMarkers();if(restore)scheduleRoute(0);}
+}
+function setPicking(on){
+  picking=on;$('mapbox').classList.toggle('picking',on);
+  if(on)$('mapinfo').textContent='지도에서 출발 위치를 클릭하세요.';
+}
+function pickStart(){if(map)setPicking(!picking);}
+function setRecStart(ll,name,quiet){
+  setPicking(false);
+  recStart={lat:+ll.lat.toFixed(6),lon:+ll.lng.toFixed(6),name};
+  if(!quiet||!$('recstart').value)$('recstart').value=name;
+  if(!startMarker){
+    startMarker=L.marker(ll,{draggable:true,zIndexOffset:1000,
+      icon:L.divIcon({className:'',html:'<div class="startm">S</div>',iconSize:[22,22],iconAnchor:[11,11]})})
+      .bindTooltip('출발 위치 · 끌어서 옮기기').addTo(map)
+      .on('dragend',e=>setRecStart(e.target.getLatLng(),'지도에서 선택한 위치'));
+  }else startMarker.setLatLng(ll);
+  if(!quiet){recs=[];$('reclist').innerHTML='<div class="hint">출발 위치를 정했습니다. 코스 추천을 누르세요.</div>';recLayer.clearLayers();
+    $('mapinfo').textContent='출발 위치를 정했습니다 · 초록 S 마커를 끌어서 옮길 수 있습니다.';}
+}
+async function resolveStart(){
+  if(recStart)return recStart;
+  const q=$('recstart').value.trim();
+  if(!q){ // 비우면 1번 구간 위치
+    const first=rowsEl()[0];
+    if(!first)throw new Error('출발 위치를 입력하거나 지도에서 선택하세요.');
+    if(!hasPos(first))await refreshMap();
+    if(!hasPos(first))throw new Error('1번 구간의 장소를 찾지 못했습니다.');
+    setRecStart(L.latLng(+first.dataset.lat,+first.dataset.lon),first.querySelectorAll('input')[1].value,true);
+    return recStart;
+  }
+  const res=await fetch('/api/geocode?q='+encodeURIComponent(q));
+  if(!res.ok)throw new Error((await res.json()).detail||'출발 위치를 찾지 못했습니다.');
+  const g=await res.json();
+  setRecStart(L.latLng(g.lat,g.lon),q,true);
+  map.setView([g.lat,g.lon],14);
+  return recStart;
+}
+async function recommend(next){
+  if(typeof L==='undefined')return;
+  const list=$('reclist');
+  let st;
+  try{st=await resolveStart();}catch(e){list.innerHTML=`<div class="hint">${esc(e.message)}</div>`;return;}
+  const dist=parseFloat($('recdist').value);
+  if(!(dist>=1&&dist<=50)){list.innerHTML='<div class="hint">목표 거리는 1~50km 사이로 입력하세요.</div>';return;}
+  recSeed=next?recSeed+1:0;
+  list.innerHTML='<div class="hint">코스를 찾는 중... 여러 방향의 실제 도로 경로를 계산하느라 5~20초 걸릴 수 있습니다.</div>';
+  recLayer.clearLayers();
+  try{
+    const res=await fetch('/api/recommend',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({lat:st.lat,lon:st.lon,distance_km:dist,seed:recSeed})});
+    if(!res.ok)throw new Error((await res.json()).detail||res.status);
+    recs=(await res.json()).routes;
+  }catch(e){list.innerHTML=`<div class="hint">추천 실패: ${esc(e.message)}</div>`;return;}
+  const pace=parseFloat($('recpace').value)||6;
+  list.innerHTML=recs.map((r,i)=>`<div class="reccard" data-i="${i}">
+     <span class="sw" style="background:${REC_COLORS[i]}"></span>
+     <div class="tx"><b>${i+1}. ${esc(r.label)}</b><br>
+      <small>${r.distance_km.toFixed(2)} km · 약 ${Math.round(r.distance_km*pace)}분${r.mode==='road'?'':' · 직선 거리'}</small></div>
+     <button data-apply="${i}">이 코스 적용</button></div>`).join('');
+  list.querySelectorAll('.reccard').forEach(c=>{
+    const i=+c.dataset.i;
+    c.onmouseenter=()=>highlightRec(i);c.onclick=()=>highlightRec(i);
+    c.querySelector('button').onclick=e=>{e.stopPropagation();applyRec(i);};
+  });
+  line.setStyle({opacity:.2});markers.eachLayer(m=>m.setOpacity(.35));
+  $('mapinfo').textContent='추천 코스 미리보기 중 · 코스를 적용하면 Run Plan이 바뀝니다.';
+  drawRecs(-1);
+  const all=recs.flatMap(r=>r.coordinates);
+  if(all.length)map.fitBounds(L.latLngBounds(all),{padding:[20,20]});
+}
+function drawRecs(sel){
+  recLayer.clearLayers();
+  recs.forEach((r,i)=>{
+    const on=sel<0||sel===i;
+    L.polyline(r.coordinates,{color:REC_COLORS[i],weight:on?5:3,opacity:on?.9:.3,dashArray:sel===i?null:'8 6'})
+     .bindTooltip(`${i+1}. ${esc(r.label)} · ${r.distance_km.toFixed(2)} km`).on('click',()=>highlightRec(i)).addTo(recLayer);
+  });
+}
+function highlightRec(i){
+  document.querySelectorAll('.reccard').forEach(c=>c.classList.toggle('sel',+c.dataset.i===i));
+  drawRecs(i);
+}
+function applyRec(i){
+  const r=recs[i],st=recStart;
+  if(!rowsEl().length)addRow(ts(6),st.name,0);
+  const rs=rowsEl(),start=rs[0];
+  const pace=parseFloat($('recpace').value)||6;
+  const [ti,li]=start.querySelectorAll('input');
+  li.value=st.name;start.dataset.lat=st.lat;start.dataset.lon=st.lon;start.classList.remove('bad');setPin(start);
+  const t0=ti.value?new Date(ti.value):null;
+  const at=km=>t0?fmt(new Date(t0.getTime()+Math.round(km*pace)*60000)):'';
+  const [w1,w2,w3]=r.waypoints,L4=r.legs_km;
+  const half=L4[0]+L4[1],total=r.distance_km;
+  rs.slice(1).forEach(x=>x.remove());
+  start.querySelectorAll('input')[2].value='0.00';
+  addRow(at(half),`반환점 (${r.label})`,half.toFixed(2),w2[0],w2[1]);
+  addRow(at(total),`${li.value} (도착)`,total.toFixed(2),start.dataset.lat,start.dataset.lon);
+  const [,mid,fin]=rowsEl();
+  seq=[{kind:'cp',row:start},{kind:'via',lat:w1[0],lon:w1[1]},{kind:'cp',row:mid},
+       {kind:'via',lat:w3[0],lon:w3[1]},{kind:'cp',row:fin}];
+  closeRecommend(false);
+  drawMarkers();needFit=true;
+  scheduleRoute(0);  // 새 경로가 그려진 뒤 updateRoute 가 화면을 맞춘다
+  $('status').textContent=`'${r.label}' 코스를 Run Plan에 적용했습니다. 날씨 데이터 동기화를 눌러 구간별 날씨를 확인하세요.`;
 }
 
 async function sync(){
