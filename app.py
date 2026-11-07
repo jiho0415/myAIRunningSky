@@ -120,6 +120,11 @@ def run_weather(plan: RunPlan):
     for cp in plan.checkpoints:
         try:
             when = datetime.fromisoformat(cp.time)
+        except ValueError:
+            raise HTTPException(422, f"시간 형식이 올바르지 않습니다: '{cp.time}' (예: 2026-11-08T06:30)")
+        if when.tzinfo is not None:  # '+09:00' 등 시간대가 붙은 입력은 KST 로 맞춘다
+            when = when.astimezone(kma.KST).replace(tzinfo=None)
+        try:
             if cp.lat is not None and cp.lon is not None:
                 place = {"lat": cp.lat, "lon": cp.lon, "name": cp.location}
             else:

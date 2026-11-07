@@ -165,14 +165,27 @@ def fetch_weather(nx: int, ny: int, when: datetime | None = None) -> dict:
     # 2) 단기예보
     if 1 < delta_h <= 60:
         vb = _vilage_base(now)
-        row = _vilage(nx, ny, vb.strftime("%Y%m%d"), vb.strftime("%H%M")).get(
-            (when.strftime("%Y%m%d"), when.strftime("%H00")))
+        table = _vilage(nx, ny, vb.strftime("%Y%m%d"), vb.strftime("%H%M"))
+        h0 = when.replace(minute=0, second=0, microsecond=0)
+        h1 = h0 + timedelta(hours=1)
+        row = table.get((h0.strftime("%Y%m%d"), h0.strftime("%H00")))
         if not row or "TMP" not in row:
             raise KMAError("해당 시각의 단기예보가 없습니다.")
+        # 예보는 1시간 단위 → 분 단위 시각은 앞뒤 정시 예보를 선형 보간 (다음 정시가 없으면 앞 정시 값)
+        nxt = table.get((h1.strftime("%Y%m%d"), h1.strftime("%H00"))) or row
+        frac = (when - h0).total_seconds() / 3600
+
+        def lerp(cat):
+            a, b = _f(row.get(cat)), _f(nxt.get(cat))
+            if a is None:
+                return b
+            return a if b is None else round(a + (b - a) * frac, 1)
+
+        near = nxt if frac >= 0.5 else row   # 하늘상태 같은 범주형 값은 가까운 정시 기준
         return {
-            "temp_c": float(row["TMP"]), "humidity": _f(row.get("REH")), "wind_ms": _f(row.get("WSD")) or 0.0,
-            "rain_prob": _f(row.get("POP")) or 0.0, "condition": _condition(row.get("SKY"), row.get("PTY")),
-            "timestamp": when.replace(minute=0).isoformat(timespec="minutes"), "kind": "forecast",
+            "temp_c": lerp("TMP"), "humidity": lerp("REH"), "wind_ms": lerp("WSD") or 0.0,
+            "rain_prob": lerp("POP") or 0.0, "condition": _condition(near.get("SKY"), near.get("PTY")),
+            "timestamp": when.replace(second=0, microsecond=0).isoformat(timespec="minutes"), "kind": "forecast",
         }
 
     raise KMAError("기상청 조회 가능 범위(직전 3시간 ~ 약 2.5일)를 벗어났습니다.")
